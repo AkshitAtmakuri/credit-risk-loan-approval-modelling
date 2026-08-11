@@ -1,0 +1,402 @@
+---
+title: "ADA_CSWK"
+output: html_document
+date: "2026-02-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(factoextra)
+library(cluster)
+library(dplyr)
+library(psych)
+library(psychTools)
+```
+
+# 1. Load the Data
+We use the LendingClub loan sample (50,000 rows). Our objective in Question 2 is to segment borrowers using origination-style borrower credit variables (not outcomes), then later evaluate policy performance by segment.
+
+```{r}
+df <- read.csv("early_2012_2013_loan_sample_with_outcome.csv", stringsAsFactors = FALSE)
+dim(df)
+```
+
+
+# 2. Feature selection for clustering (Q2a)
+We select a small set of interpretable borrower credit variables that reflect:
+	•	affordability (DTI, annual income),
+	•	current credit utilisation (revolving utilisation),
+	•	recent credit-seeking behaviour (inquiries),
+	•	delinquency history,
+	•	current depth of credit file (open/total accounts).
+
+```{r}
+cluster_vars <- c(
+  "dti",
+  "revol_util",
+  "annual_inc",
+  "inq_last_6mths",
+  "delinq_2yrs",
+  "open_acc",
+  "total_acc"
+)
+```
+
+# 3. Data cleaning and missing values
+revol_util sometimes appears as a percent string. We convert it to numeric.
+For missing values, we use median imputation to keep the full sample size and avoid dropping many rows.
+
+```{r}
+# Clean revol_util in the main df so profiling works
+if (is.character(df$revol_util)) {
+  df$revol_util <- as.numeric(gsub("%", "", df$revol_util))
+}
+
+X_raw <- df %>% select(all_of(cluster_vars))
+
+X_imp <- X_raw
+for(v in names(X_imp)) {
+  X_imp[[v]] <- as.numeric(X_imp[[v]])
+  med <- median(X_imp[[v]], na.rm = TRUE)
+  X_imp[[v]][is.na(X_imp[[v]])] <- med
+}
+summary(X_imp)
+```
+
+# 4. Outlier screening (optional diagnostic)
+We use Mahalanobis distance as a multivariate outlier screen. This step is primarily diagnostic; we remove extreme points (p < 0.001) to reduce distortion of distance-based clustering.
+
+```{r}
+k <- ncol(X_imp)
+Maha <- mahalanobis(X_imp, colMeans(X_imp), cov(X_imp))
+
+# workshop uses df = k-1
+MahaP <- pchisq(Maha, df = k-1, lower.tail = FALSE)
+
+outlier_idx <- which(MahaP < 0.001)
+length(outlier_idx)
+
+# Option: remove outliers (if any)
+X_no <- X_imp
+df_no <- df
+if(length(outlier_idx) > 0) {
+  X_no <- X_imp[-outlier_idx, ]
+  df_no <- df[-outlier_idx, ]
+}
+```
+
+# 5. Correlation check (multicollinearity context)
+In clustering, multicollinearity does not break estimation like regression, but highly correlated variables can overweight one underlying dimension in distance calculations (because “the same signal” is counted twice). We therefore check correlations to ensure we are not feeding many near-duplicate variables.
+
+```{r}
+cor_mat <- cor(X_no)
+round(cor_mat, 2)
+lowerCor(X_no)
+```
+
+# 6. Standardisation
+Because variables are on different scales (e.g., income vs counts), we standardise to mean 0 and sd 1 before distance-based clustering.
+
+```{r}
+X <- scale(X_no)
+```
+
+# 7. Hierarchical clustering (Ward.D2) on a sample (memory-safe)
+Full hierarchical clustering on ~50k observations is memory intensive because the distance matrix is O(n^2).
+We therefore build a dendrogram on a random sample (n=3000) to visually inspect the structure and support the choice of k.
+
+```{r}
+set.seed(42)
+
+n_total <- nrow(X)
+
+# choose a sample size that will fit in memory (start with 2000–5000)
+n_hc <- min(3000, n_total)
+hc_idx <- sample(seq_len(n_total), n_hc)
+
+X_hc <- X[hc_idx, , drop = FALSE]
+
+distance_mat <- dist(X_hc, method = "euclidean")
+hc <- hclust(distance_mat, method = "ward.D2")
+plot(hc, labels = FALSE, hang = -1,
+     main = paste("Hierarchical Dendrogram (Ward.D2) - sample n =", n_hc))
+```
+
+## Choosing k on the hierarchical sample
+We use two complementary diagnostics:
+	•	Elbow (WCSS): diminishing returns in within-cluster compactness
+	•	Silhouette: separation and cohesion quality
+
+```{r}
+wcss_hclust <- function(k, hc, X) {
+  clusters <- cutree(hc, k = k)
+  total <- 0
+  for (g in unique(clusters)) {
+    Xg <- X[clusters == g, , drop = FALSE]
+    total <- total + sum(scale(Xg, center = TRUE, scale = FALSE)^2)
+  }
+  total
+}
+
+# Elbow and silhouette on sampled data only
+Kmax <- 10
+wcss <- numeric(Kmax)
+for (k in 1:Kmax) wcss[k] <- wcss_hclust(k, hc=hc, X=X_hc)
+
+plot(1:Kmax, wcss, type="b",
+     xlab="Number of clusters (k)",
+     ylab="Total WCSS",
+     main="Elbow method (hierarchical) - SAMPLE")
+
+sil <- numeric(Kmax); sil[1] <- NA
+dist_hc <- dist(X_hc)
+for (k in 2:Kmax) {
+  cl <- cutree(hc, k = k)
+  sil[k] <- mean(silhouette(cl, dist_hc)[, 3])
+}
+
+plot(2:Kmax, sil[2:Kmax], type="b",
+     xlab="k", ylab="Mean silhouette width",
+     main="Silhouette vs k (hierarchical) - SAMPLE")
+
+best_k_sil <- which.max(sil)
+cat("Best k by silhouette (sample):", best_k_sil, "\n")
+```
+
+# 8. K-means clustering on the full dataset (final segmentation)
+We set k=3 (consistent with the hierarchical structure and interpretability).
+We initialise k-means centres using hierarchical cluster means (computed on the sample), then refit on the full dataset.
+
+```{r}
+K <- 3
+hc_labels_sample <- cutree(hc, k = K)
+table(hc_labels_sample)
+```
+
+```{r}
+X_df <- as.data.frame(X)
+X_hc_df <- X_df[hc_idx, , drop = FALSE]
+
+hc_centres <- aggregate(X_hc_df, by = list(cluster = hc_labels_sample), FUN = mean)
+init_centers <- as.matrix(hc_centres[, -1, drop = FALSE])
+```
+
+```{r}
+set.seed(55)
+km_hc_init <- kmeans(X_df, centers = init_centers, nstart = 1)  # nstart=1 because centers fixed
+km_hc_init$size
+km_hc_init$centers
+km_hc_init$betweenss / km_hc_init$totss
+```
+
+```{r}
+K2 <- 3  # <-- choose based on gap statistic (and interpretability)
+set.seed(55)
+km_final <- kmeans(X_df, centers = K2, nstart = 25)
+table(km_final$cluster)
+```
+
+```{r}
+# Compare on the SAME points: the hierarchical sample
+km_on_sample <- km_final$cluster[hc_idx]
+
+table(hc_labels_sample)
+table(km_on_sample)
+
+# Cross-tab agreement on sample
+table(Hierarchical = hc_labels_sample, KMeans = km_on_sample)
+```
+
+# 9. Cluster profiling and labels (Q2b)
+We profile clusters using original (unscaled) variables for interpretability.
+
+```{r}
+df_profile <- df_no %>%
+  mutate(
+    cluster_km = km_final$cluster,
+    cluster_hc = NA_integer_
+  )
+
+df_profile$cluster_hc[hc_idx] <- hc_labels_sample
+
+# Profile using ORIGINAL (unscaled) variables for interpretability
+df_profile %>%
+  group_by(cluster_km) %>%
+  summarise(across(all_of(cluster_vars), mean, na.rm = TRUE),
+            n = n()) %>%
+  arrange(cluster_km)
+```
+
+## Borrower risk by cluster (outcome stats)
+loan_is_bad is stored as TRUE/FALSE in the CSV. Converting to integer gives 1 for TRUE and 0 for FALSE, so the mean is the default rate.
+
+```{r}
+if ("loan_is_bad" %in% names(df_profile)) {
+
+  # Convert TRUE/FALSE -> 1/0 for safe averaging
+  # Robust conversion: works whether loan_is_bad is logical, factor, or "TRUE"/"FALSE" character
+  df_profile$loan_is_bad_num <- as.integer(as.logical(as.character(df_profile$loan_is_bad)))
+
+  df_profile %>%
+    group_by(cluster_km) %>%
+    summarise(
+      default_rate = mean(loan_is_bad_num, na.rm = TRUE),
+      n = n()
+    )
+}
+```
+```{r}
+mean(df_profile$loan_is_bad_num, na.rm = TRUE)
+```
+
+```{r}
+cat("Best silhouette k:", which.max(sil), "\n")
+table(df_profile$loan_is_bad, useNA="ifany")
+```
+
+# 10. (Optional) High/Low qualitative summary table for reporting
+To make cluster interpretation easy to read, we compare each cluster mean to the overall median and label it HIGH/LOW.
+
+```{r}
+# Overall averages for comparison
+overall <- df_profile %>%
+  summarise(across(all_of(cluster_vars), mean, na.rm = TRUE))
+
+# Cluster means + "relative to overall" (z-like direction)
+cluster_means <- df_profile %>%
+  group_by(cluster_km) %>%
+  summarise(across(all_of(cluster_vars), mean, na.rm = TRUE),
+            n = n()) %>%
+  arrange(cluster_km)
+
+cluster_means
+overall
+```
+
+```{r}
+# Compare cluster means to overall means (direction only)
+dir_table <- cluster_means
+for (v in cluster_vars) {
+  dir_table[[v]] <- ifelse(cluster_means[[v]] > overall[[v]], "HIGH", "LOW")
+}
+dir_table
+```
+
+```{r}
+df_profile$loan_is_bad_num <- as.integer(as.logical(as.character(df_profile$loan_is_bad)))
+
+df_profile %>%
+  group_by(cluster_km) %>%
+  summarise(default_rate = mean(loan_is_bad_num, na.rm = TRUE),
+            n = n()) %>%
+  arrange(cluster_km)
+```
+
+Up to this point, we have identified borrower clusters based on credit characteristics. In Q2c, we evaluate whether the relative performance of Policy A vs Policy B differs across these borrower segments. This reveals whether a policy that looks best overall may underperform for specific borrower types.
+
+
+# Q2c: Apply Policies A & B
+
+# Ensure grade is character (sometimes it can be factor)
+```{r}
+df_profile$grade <- as.character(df_profile$grade)
+
+df_profile <- df_profile %>%
+  mutate(
+    approved_A = grade %in% c("A","B","C") & dti <= 17,
+    approved_B = grade %in% c("A","B","C","D","E") & dti <= 25
+  )
+
+# Quick sanity checks (counts approved)
+sum(df_profile$approved_A, na.rm = TRUE)
+sum(df_profile$approved_B, na.rm = TRUE)
+```
+
+```{r}
+policy_metrics <- function(data, approve_col, loss = 5) {
+  approve <- data[[approve_col]]
+  y <- data$loan_is_bad_num  # 1 = bad, 0 = good
+  
+  # If nothing approved in a cluster, avoid NaN
+  if (sum(approve, na.rm = TRUE) == 0) {
+    return(tibble(
+      approval_rate = mean(approve, na.rm = TRUE),
+      default_rate_approved = NA_real_,
+      expected_value_proxy = NA_real_,
+      n = nrow(data),
+      n_approved = 0
+    ))
+  }
+  
+  default_rate_approved <- mean(y[approve], na.rm = TRUE)
+  approval_rate <- mean(approve, na.rm = TRUE)
+  
+  # EV proxy per approved loan
+  ev <- (1 - default_rate_approved) * 1 - default_rate_approved * loss
+  
+  tibble(
+    approval_rate = approval_rate,
+    default_rate_approved = default_rate_approved,
+    expected_value_proxy = ev,
+    n = nrow(data),
+    n_approved = sum(approve, na.rm = TRUE)
+  )
+}
+```
+
+```{r}
+loss_assumption <- 5   
+
+A_cluster <- df_profile %>%
+  group_by(cluster_km) %>%
+  group_modify(~ policy_metrics(.x, "approved_A", loss = loss_assumption)) %>%
+  mutate(policy = "A")
+
+B_cluster <- df_profile %>%
+  group_by(cluster_km) %>%
+  group_modify(~ policy_metrics(.x, "approved_B", loss = loss_assumption)) %>%
+  mutate(policy = "B")
+
+cluster_policy_results <- bind_rows(A_cluster, B_cluster) %>%
+  arrange(cluster_km, policy)
+
+cluster_policy_results
+```
+
+```{r}
+overall_A <- policy_metrics(df_profile, "approved_A", loss = loss_assumption) %>% mutate(policy="A", cluster_km="Overall")
+overall_B <- policy_metrics(df_profile, "approved_B", loss = loss_assumption) %>% mutate(policy="B", cluster_km="Overall")
+
+bind_rows(overall_A, overall_B)
+```
+
+```{r}
+wide <- cluster_policy_results %>%
+  select(cluster_km, policy, approval_rate, default_rate_approved, expected_value_proxy) %>%
+  tidyr::pivot_wider(
+    names_from = policy,
+    values_from = c(approval_rate, default_rate_approved, expected_value_proxy)
+  ) %>%
+  mutate(
+    delta_approval = approval_rate_B - approval_rate_A,
+    delta_default_approved = default_rate_approved_B - default_rate_approved_A,
+    delta_EV = expected_value_proxy_B - expected_value_proxy_A
+  )
+
+wide
+```
+
+```{r}
+library(knitr)
+
+wide %>%
+  select(cluster_km,
+         approval_rate_A, approval_rate_B,
+         default_rate_approved_A, default_rate_approved_B,
+         expected_value_proxy_A, expected_value_proxy_B,
+         delta_approval, delta_default_approved, delta_EV) %>%
+  kable(digits = 3, caption = "Policy Comparison by Cluster")
+```
+
+
+
