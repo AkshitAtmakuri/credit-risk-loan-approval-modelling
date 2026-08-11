@@ -2,8 +2,6 @@
 
 Segmenting LendingClub borrowers into four risk bands, then setting a different approval threshold for each band instead of one global cutoff. Recall on the highest risk segment reaches 82.6%, against 63.1% for a logistic baseline.
 
-Built for the Advanced Data Analytics module of the MSc Business Analytics at Warwick Business School.
-
 ## Problem
 
 Default prediction on consumer loans has two problems that a single accuracy number hides.
@@ -83,4 +81,4 @@ Python, PyTorch, scikit-learn, imbalanced-learn (SMOTE), pandas, NumPy, R, facto
 
 ## Credit
 
-Group coursework. The team collaborated on every stage: feature selection, segmentation, model architecture and the threshold policy. Assignment briefs and the marked report are deliberately not included in this repository.
+Group project. The team collaborated on every stage: feature selection, segmentation, model architecture and the threshold policy. Project briefs and the written report are not included in this repository.
